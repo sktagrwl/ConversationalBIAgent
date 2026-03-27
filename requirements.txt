@@ -4,3 +4,4 @@ streamlit>=1.40.0
 plotly>=5.24.0
 pandas>=2.2.0
 python-dotenv>=1.0.0
+kagglehub>=0.3.4

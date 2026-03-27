@@ -1,27 +1,32 @@
 import streamlit as st
-from src.database import get_connection
+from src.database import get_connection, get_schema
 from src.agent import answer_question
-from src.visualization import suggest_chart
+from src.visualization import render_chart
+from src.config import MAX_ROWS
 
 st.set_page_config(page_title="Conversational BI Agent", layout="wide")
 st.title("Conversational BI Agent")
 
-# Initialize DB connection once per session
+# Initialize DB connection once per session.
+# On first run against new CSVs, get_connection() materializes them (slow once).
 if "con" not in st.session_state:
-    st.session_state.con = get_connection()
+    with st.status("Connecting to database...", expanded=True) as status:
+        st.write("Checking for new CSV files to materialize...")
+        st.session_state.con = get_connection()
+        status.update(label="Database ready.", state="complete", expanded=False)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Sidebar: show loaded tables
+# Sidebar: show loaded tables with row counts
 with st.sidebar:
     st.header("Loaded Tables")
-    from src.database import get_schema
     schema = get_schema(st.session_state.con)
     if schema:
-        for table, cols in schema.items():
-            with st.expander(table):
-                for c in cols:
+        for table, info in schema.items():
+            label = f"{table} ({info['row_count']:,} rows)"
+            with st.expander(label):
+                for c in info["columns"]:
                     st.text(f"{c['column']}  ({c['type']})")
     else:
         st.info("No CSV files found in data/.\nAdd your CSVs and restart.")
@@ -30,12 +35,18 @@ with st.sidebar:
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        if msg.get("df") is not None:
-            fig = suggest_chart(msg["df"], msg["content"])
+        df = msg.get("df")
+        if df is not None:
+            if msg.get("truncated"):
+                st.warning(
+                    f"Results truncated to {MAX_ROWS:,} rows. "
+                    "Add filters or aggregation to reduce the result set."
+                )
+            fig = render_chart(df, msg.get("chart_type", "table"))
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.dataframe(msg["df"], use_container_width=True)
+                st.dataframe(df, use_container_width=True)
 
 # Input
 if prompt := st.chat_input("Ask a question about your data..."):
@@ -45,19 +56,33 @@ if prompt := st.chat_input("Ask a question about your data..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            sql, df, reasoning = answer_question(prompt, st.session_state.con)
+            sql, df, truncated, reasoning, chart_type, _ = answer_question(
+                prompt, st.session_state.con
+            )
 
         if sql:
             with st.expander("SQL"):
                 st.code(sql, language="sql")
 
-        st.markdown(reasoning.split("```")[0].strip())  # Show reasoning before the SQL block
+        st.markdown(reasoning)
 
-        if df is not None and not df.empty:
-            fig = suggest_chart(df, prompt)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.dataframe(df, use_container_width=True)
+        if df is not None:
+            if len(df) > 0:
+                if truncated:
+                    st.warning(
+                        f"Results truncated to {MAX_ROWS:,} rows. "
+                        "Add filters or aggregation to reduce the result set."
+                    )
+                fig = render_chart(df, chart_type)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.dataframe(df, use_container_width=True)
 
-        st.session_state.messages.append({"role": "assistant", "content": reasoning, "df": df})
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": reasoning,
+            "df": df,
+            "truncated": truncated,
+            "chart_type": chart_type,
+        })

@@ -3,40 +3,34 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 
-def suggest_chart(df: pd.DataFrame, question: str) -> go.Figure | None:
+def render_chart(df: pd.DataFrame, chart_type: str) -> go.Figure | None:
     """
-    Heuristically pick a chart type based on DataFrame shape and question keywords.
-    Returns a Plotly figure or None if a table view is more appropriate.
+    Map LLM-chosen chart_type → Plotly figure.
+
+    The LLM decides chart_type during the planning phase (before data exists),
+    so this function only maps the decision to a figure — no heuristics, no data inspection.
+    Returns None → caller falls back to st.dataframe.
     """
-    if df is None or df.empty or len(df.columns) < 2:
+    if df is None or df.empty:
         return None
 
-    q = question.lower()
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     non_numeric_cols = df.select_dtypes(exclude="number").columns.tolist()
 
-    # Time-series: line chart
-    if any(k in q for k in ["trend", "over time", "monthly", "weekly", "daily", "by month", "by year"]):
-        if non_numeric_cols and numeric_cols:
-            return px.line(df, x=non_numeric_cols[0], y=numeric_cols[0], title=question)
+    x = non_numeric_cols[0] if non_numeric_cols else (numeric_cols[0] if len(numeric_cols) > 1 else None)
+    y = numeric_cols[0] if numeric_cols else None
 
-    # Distribution / comparison: bar chart
-    if any(k in q for k in ["top", "most", "least", "compare", "by category", "per", "breakdown", "distribution"]):
-        if non_numeric_cols and numeric_cols:
-            return px.bar(df, x=non_numeric_cols[0], y=numeric_cols[0], title=question)
+    if chart_type == "bar" and x and y:
+        return px.bar(df, x=x, y=y)
 
-    # Proportion: pie chart
-    if any(k in q for k in ["share", "proportion", "percentage", "pie"]):
-        if non_numeric_cols and numeric_cols:
-            return px.pie(df, names=non_numeric_cols[0], values=numeric_cols[0], title=question)
+    if chart_type == "line" and x and y:
+        return px.line(df, x=x, y=y)
 
-    # Correlation: scatter
-    if any(k in q for k in ["correlation", "vs", "versus", "relationship"]):
-        if len(numeric_cols) >= 2:
-            return px.scatter(df, x=numeric_cols[0], y=numeric_cols[1], title=question)
+    if chart_type == "scatter" and len(numeric_cols) >= 2:
+        return px.scatter(df, x=numeric_cols[0], y=numeric_cols[1])
 
-    # Default: bar if shape is right, else None (show as table)
-    if non_numeric_cols and numeric_cols and len(df) <= 50:
-        return px.bar(df, x=non_numeric_cols[0], y=numeric_cols[0], title=question)
+    if chart_type == "pie" and x and y:
+        return px.pie(df, names=x, values=y)
 
+    # "table" or unrecognised type — caller renders st.dataframe
     return None
