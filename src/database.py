@@ -13,7 +13,9 @@ QueryResult = collections.namedtuple("QueryResult", ["df", "truncated"])
 # Exported so agent._schema_to_text() can classify tables without extra DB queries.
 DERIVED_TABLES: frozenset[str] = frozenset({
     "order_products",
+    "fact_orders",
     "product_metrics",
+    "aisle_metrics",
     "order_metrics",
     "user_metrics",
     "department_metrics",
@@ -21,10 +23,12 @@ DERIVED_TABLES: frozenset[str] = frozenset({
 
 # Build order:
 #   1. order_products     — unified prior+train product rows (test excluded: no basket data)
-#   2. product_metrics    — depends on order_products
-#   3. order_metrics      — depends on order_products
-#   4. user_metrics       — depends on order_metrics
-#   5. department_metrics — depends on product_metrics
+#   2. fact_orders        — full hierarchy denormalized (depends on order_products + lookups)
+#   3. aisle_metrics      — depends on fact_orders
+#   4. product_metrics    — depends on order_products
+#   5. order_metrics      — depends on order_products
+#   6. user_metrics       — depends on order_metrics
+#   7. department_metrics — depends on fact_orders (fixed: correct reorder_rate formula)
 _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
     (
         "order_products",
@@ -33,6 +37,43 @@ _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
         SELECT order_id, product_id, add_to_cart_order, reordered FROM order_products__prior
         UNION ALL
         SELECT order_id, product_id, add_to_cart_order, reordered FROM order_products__train
+        """,
+    ),
+    (
+        "fact_orders",
+        """
+        CREATE TABLE IF NOT EXISTS fact_orders AS
+        SELECT
+            op.order_id,
+            op.product_id,
+            p.product_name,
+            a.aisle_id,
+            a.aisle,
+            d.department_id,
+            d.department,
+            op.reordered,
+            op.add_to_cart_order
+        FROM order_products op
+        JOIN products p    ON op.product_id   = p.product_id
+        JOIN aisles a      ON p.aisle_id      = a.aisle_id
+        JOIN departments d ON p.department_id = d.department_id
+        """,
+    ),
+    (
+        "aisle_metrics",
+        """
+        CREATE TABLE IF NOT EXISTS aisle_metrics AS
+        SELECT
+            aisle_id,
+            aisle,
+            department_id,
+            department,
+            COUNT(DISTINCT product_id)                  AS product_count,
+            COUNT(*)                                    AS total_orders,
+            ROUND(SUM(reordered) * 1.0 / COUNT(*), 4)  AS reorder_rate,
+            ROUND(AVG(add_to_cart_order), 2)            AS avg_cart_position
+        FROM fact_orders
+        GROUP BY aisle_id, aisle, department_id, department
         """,
     ),
     (
@@ -99,22 +140,35 @@ _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
     ),
     (
         "department_metrics",
-        # Joins product_metrics (not raw 32M table).
+        # Built from fact_orders so reorder_rate is computed correctly at department level.
+        # AVG(product_metrics.reorder_rate) was wrong — it averaged product-level rates.
         """
         CREATE TABLE IF NOT EXISTS department_metrics AS
         SELECT
-            d.department_id,
-            d.department,
-            COUNT(DISTINCT pm.product_id)       AS product_count,
-            SUM(pm.total_orders)                AS total_orders,
-            ROUND(AVG(pm.reorder_rate), 4)      AS avg_reorder_rate,
-            ROUND(AVG(pm.avg_cart_position), 2) AS avg_cart_position
-        FROM departments d
-        JOIN product_metrics pm ON d.department_id = pm.department_id
-        GROUP BY d.department_id, d.department
+            department_id,
+            department,
+            COUNT(DISTINCT product_id)                  AS product_count,
+            COUNT(*)                                    AS total_orders,
+            ROUND(SUM(reordered) * 1.0 / COUNT(*), 4)  AS avg_reorder_rate,
+            ROUND(AVG(add_to_cart_order), 2)            AS avg_cart_position
+        FROM fact_orders
+        GROUP BY department_id, department
         """,
     ),
 ]
+
+
+def _migrate_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    One-time migration: if fact_orders is missing, drop stale derived tables
+    so _build_derived_tables() rebuilds them with updated SQL.
+    Safe to call on every startup — no-op once fact_orders exists.
+    """
+    existing = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
+    if "fact_orders" not in existing:
+        print("[database] Migrating schema: dropping stale derived tables to rebuild ...")
+        for tbl in ("department_metrics", "aisle_metrics"):
+            con.execute(f"DROP TABLE IF EXISTS {tbl}")
 
 
 def _build_derived_tables(con: duckdb.DuckDBPyConnection) -> None:
@@ -156,7 +210,8 @@ def get_connection() -> duckdb.DuckDBPyConnection:
         )
         print(f"[database] Done: '{table_name}'")
 
-    # Phase 2: Build derived/pre-aggregated tables
+    # Phase 2: Migrate schema (no-op if already up to date), then build derived tables
+    _migrate_schema(con)
     _build_derived_tables(con)
 
     return con

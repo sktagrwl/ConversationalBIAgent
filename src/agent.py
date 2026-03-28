@@ -1,4 +1,5 @@
 import xml.etree.ElementTree as ET
+import re
 import anthropic
 import pandas as pd
 from src.config import ANTHROPIC_API_KEY, MODEL
@@ -39,7 +40,11 @@ def _parse_response(text: str) -> tuple[str, str, str] | None:
       - LLM NEVER sees data rows
     """
     try:
-        root = ET.fromstring(text.strip())
+        match = re.search(r"<response>.*?</response>", text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            return None
+        valid_xml = match.group(0)
+        root = ET.fromstring(valid_xml)
         reasoning = (root.findtext("reasoning") or "").strip()
         chart_type = (root.findtext("chart_type") or "table").strip().lower()
         sql = (root.findtext("sql") or "").strip()
@@ -71,22 +76,47 @@ def answer_question(
 
 {schema_text}
 
-Table selection rules — follow these strictly:
-- Tables marked DERIVED are pre-aggregated. Use them as your first choice for any analytical question.
-- Tables marked RAW have tens of millions of rows. Never query them directly — use the corresponding DERIVED table instead.
-- Lookup tables (aisles, departments, products) may be joined freely.
-- When no derived table covers the question, aggregate the RAW table immediately with GROUP BY + COUNT/SUM/AVG. Never SELECT * from a RAW table.
+Product hierarchy (3 levels):
+  product → aisle → department
+  Every fact_orders row contains all three levels pre-joined. Use it as the base for any hierarchy question.
 
-SQL performance rules — follow these strictly:
-- Filter before joining: place WHERE on the larger table BEFORE the JOIN, or pre-filter with a CTE/subquery.
-- Join order: smaller table LEFT, larger table RIGHT.
-- Top-N: whenever the user asks for "top N", "most popular", "highest", or "best" — always include ORDER BY <metric_column> DESC LIMIT 10 (adjust N if the user specifies a different number).
+Query planning — run these 3 steps before writing SQL for any hierarchy or metric question:
+
+  Step 1 — Detect aggregation level (what the user wants to group by):
+    - "products" / "items" / "what product"  → GROUP BY product_id, product_name
+    - "aisles" / "categories"                → GROUP BY aisle_id, aisle
+    - "departments" / "sections"             → GROUP BY department_id, department
+
+  Step 2 — Detect metric (how it must be computed):
+    - "reorder rate"         → SUM(reordered) * 1.0 / COUNT(*)   ← always recompute at target level
+    - "most popular" / "top" → COUNT(*) DESC
+    - "basket size"          → use order_metrics.basket_size
+
+  Step 3 — Choose table:
+    - Level needs fresh metric computation → fact_orders + GROUP BY <level>
+    - Level matches a pre-aggregated table AND no further computation needed
+        → use product_metrics / aisle_metrics / department_metrics directly
+    - NEVER roll up a pre-aggregated metric (e.g. AVG(product_metrics.reorder_rate) for
+      department-level reorder rate is WRONG — recompute from fact_orders instead)
+
+Table selection rules:
+- Tables marked DERIVED are pre-aggregated. Use them as your first choice for simple lookups.
+- Tables marked RAW have tens of millions of rows. Never query them directly.
+- Lookup tables (aisles, departments, products) may be joined freely.
+
+SQL performance rules:
+- Filter before joining: WHERE on the larger table before the JOIN, or use a CTE.
+- Top-N: always include ORDER BY <metric_column> DESC LIMIT 10 (adjust if user specifies N).
 - Never write bare SELECT * — select specific columns or aggregate. SELECT COUNT(*) is allowed.
 - When result size is uncertain, add LIMIT 100.
 
 Output your response in this EXACT XML format — no text outside the tags:
 <response>
-  <reasoning>1-3 sentences: which tables you'll use and why</reasoning>
+  <reasoning>
+    Step 1: Aggregation level = [product|aisle|department|other]
+    Step 2: Metric = [metric name and formula]
+    Step 3: Table = [which table and why]
+  </reasoning>
   <chart_type>bar</chart_type>
   <sql>
     SELECT ...
@@ -108,27 +138,47 @@ Data partitioning context (Instacart dataset):
 
 Use DuckDB SQL syntax. All table names are exactly as listed above."""
 
-    try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": question}],
-        )
-    except anthropic.APIError as e:
-        return None, None, False, f"**Anthropic API Error:** {e.message}", "table", ""
+    messages = [{"role": "user", "content": question}]
 
-    raw = response.content[0].text
-    parsed = _parse_response(raw)
+    for attempt in range(2):
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=messages,
+            )
+        except anthropic.APIError as e:
+            return None, None, False, f"**Anthropic API Error:** {e.message}", "table", ""
 
-    if not parsed:
-        # LLM didn't follow format — surface the raw response as reasoning, no chart
-        return None, None, False, raw, "table", raw
+        raw = response.content[0].text
+        parsed = _parse_response(raw)
 
-    reasoning, chart_type, sql = parsed
+        if not parsed:
+            # LLM didn't follow format — surface the raw response as reasoning, no chart
+            return None, None, False, raw, "table", raw
 
-    try:
-        result = run_query(con, sql)
-        return sql, result.df, result.truncated, reasoning, chart_type, raw
-    except Exception as e:
-        return sql, None, False, f"{reasoning}\n\n**Query error:** {e}", chart_type, raw
+        reasoning, chart_type, sql = parsed
+
+        try:
+            result = run_query(con, sql)
+            return sql, result.df, result.truncated, reasoning, chart_type, raw
+        except Exception as e:
+            if attempt == 0:
+                # First failure — give the LLM its own output + error, let it self-correct
+                messages.extend([
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"That SQL produced an error:\n```\n{e}\n```\n"
+                            "Please analyse the error, fix the SQL, and respond in the same XML format."
+                        ),
+                    },
+                ])
+            else:
+                # Second failure — give up
+                return sql, None, False, f"{reasoning}\n\n**Query error (after retry):** {e}", chart_type, raw
+
+    # Unreachable — every loop iteration returns explicitly
+    return None, None, False, "Unexpected error", "table", ""  # pragma: no cover

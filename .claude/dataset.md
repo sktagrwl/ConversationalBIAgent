@@ -1,0 +1,42 @@
+# Dataset Rules
+
+These are structural properties of the data that every part of the system must respect — not dataset-specific quirks, but fundamental constraints that affect how queries must be written.
+
+## Rule 1: Raw Tables Are Too Large to Scan
+
+Raw CSV tables are not suitable for direct analytics queries. The largest raw table alone has 32M+ rows. Scanning them will be slow, memory-intensive, and unnecessary.
+
+**Always use derived tables for analytics.** They are pre-aggregated, indexed, and purpose-built.
+
+| Derived Table | Replaces | Use For |
+|---|---|---|
+| `order_products` | prior + train CSVs | Any product-order relationship analysis |
+| `product_metrics` | order_products scan | Per-product stats (counts, reorder rate, cart position) |
+| `order_metrics` | order_products scan | Per-order stats (basket size, reorder ratio) |
+| `user_metrics` | order_metrics scan | Per-user aggregates |
+| `department_metrics` | product_metrics scan | Per-department aggregates |
+
+The agent's system prompt annotates raw tables as `RAW — avoid` and derived tables as `DERIVED — PREFER THIS` to enforce this at the LLM level.
+
+## Rule 2: The eval_set Partition
+
+The raw data splits rows across three ML evaluation partitions via an `eval_set` column:
+
+| Partition | Description | Has basket data? |
+|---|---|---|
+| `prior` | All historical orders per user | Yes |
+| `train` | Most recent order per user (ML label) | Yes |
+| `test` | Most recent order for held-out users | **No** |
+
+**Critical rules:**
+
+- `order_products` unifies `prior` + `train`. It intentionally excludes `test` (no basket contents).
+- **Never write `WHERE eval_set = 'prior'`** — this silently discards valid `train` rows and understates all metrics.
+- Any filter on `eval_set` in a query is almost certainly a bug.
+- There is no need to think about `eval_set` when querying derived tables — the partition is already resolved.
+
+## Rule 3: CSV → Table Name Mapping
+
+`data/<name>.csv` → `<name>` table in DuckDB. This is automatic on startup.
+
+Deleting `data/warehouse.duckdb` forces full re-materialization from CSVs on next app start. Do this when CSVs change.
