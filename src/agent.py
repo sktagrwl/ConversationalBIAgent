@@ -1,5 +1,7 @@
 import xml.etree.ElementTree as ET
 import re
+import json
+from typing import Any
 import anthropic
 import pandas as pd
 from src.config import ANTHROPIC_API_KEY, MODEL
@@ -7,6 +9,32 @@ from src.database import get_schema, run_query, DERIVED_TABLES
 
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+MAX_TOOL_ITERATIONS = 10
+MAX_HISTORY_TURNS = 10  # prior conversation turns (each turn = 1 user + 1 assistant msg)
+
+RUN_SQL_TOOL = {
+    "name": "run_sql",
+    "description": (
+        "Execute a SQL query against the DuckDB warehouse. "
+        "Use this to explore data, check counts, inspect sample values, or run "
+        "intermediate analytical queries before forming your final answer."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sql": {
+                "type": "string",
+                "description": "The SQL query to execute. Must be a SELECT statement.",
+            },
+            "label": {
+                "type": "string",
+                "description": "A short description of what this query is checking (for the reasoning trace).",
+            },
+        },
+        "required": ["sql"],
+    },
+}
 
 
 def _schema_to_text(schema: dict) -> str:
@@ -37,7 +65,7 @@ def _parse_response(text: str) -> tuple[str, str, str] | None:
     LLM role boundary — enforced by this parser:
       - LLM receives: schema metadata + question
       - LLM outputs: reasoning, chart_type, SQL
-      - LLM NEVER sees data rows
+      - LLM NEVER sees data rows (only tool_result summaries for intermediate steps)
     """
     try:
         match = re.search(r"<response>.*?</response>", text, re.DOTALL | re.IGNORECASE)
@@ -56,12 +84,12 @@ def _parse_response(text: str) -> tuple[str, str, str] | None:
 
 
 def answer_question(
-    question: str, con
+    question: str, con, history: list[dict[str, Any]] | None = None
 ) -> tuple[str | None, pd.DataFrame | None, bool, str, str, str]:
     """
-    LLM plans (schema + question → reasoning + chart_type + SQL).
-    DuckDB executes (SQL → DataFrame).
-    LLM never sees data rows.
+    Tool-use agent: LLM can call run_sql for intermediate exploration,
+    then gives a final XML response with reasoning, chart_type, and display SQL.
+    Conversation history is included for multi-turn context.
 
     Returns (sql, dataframe, truncated, reasoning, chart_type, raw_llm_response).
     """
@@ -72,13 +100,31 @@ def answer_question(
 
     schema_text = _schema_to_text(schema)
 
-    system_prompt = f"""You are a SQL expert and data analyst. You have access to the following tables:
+    system_prompt = f"""You are a SQL expert and data analyst with access to the following DuckDB tables:
 
 {schema_text}
 
 Product hierarchy (3 levels):
   product → aisle → department
   Every fact_orders row contains all three levels pre-joined. Use it as the base for any hierarchy question.
+
+You have a run_sql tool. Use it to:
+- Explore the data before committing to a final query
+- Validate assumptions (e.g. check column values, NULL rates, row counts)
+- Run intermediate analytical steps when the question requires multi-step reasoning
+
+When you are ready to give the final answer, respond with this EXACT XML format — no text outside the tags:
+<response>
+  <reasoning>
+    Step 1: Aggregation level = [product|aisle|department|other]
+    Step 2: Metric = [metric name and formula]
+    Step 3: Table = [which table and why]
+  </reasoning>
+  <chart_type>bar</chart_type>
+  <sql>
+    SELECT ...
+  </sql>
+</response>
 
 Query planning — run these 3 steps before writing SQL for any hierarchy or metric question:
 
@@ -110,20 +156,7 @@ SQL performance rules:
 - Never write bare SELECT * — select specific columns or aggregate. SELECT COUNT(*) is allowed.
 - When result size is uncertain, add LIMIT 100.
 
-Output your response in this EXACT XML format — no text outside the tags:
-<response>
-  <reasoning>
-    Step 1: Aggregation level = [product|aisle|department|other]
-    Step 2: Metric = [metric name and formula]
-    Step 3: Table = [which table and why]
-  </reasoning>
-  <chart_type>bar</chart_type>
-  <sql>
-    SELECT ...
-  </sql>
-</response>
-
-Chart type guide:
+Chart type guide (for final <chart_type>):
 - bar: comparisons, rankings, top-N (most common choice)
 - line: time-series or trends over an ordered sequence
 - scatter: correlation between two numeric dimensions
@@ -138,47 +171,106 @@ Data partitioning context (Instacart dataset):
 
 Use DuckDB SQL syntax. All table names are exactly as listed above."""
 
-    messages = [{"role": "user", "content": question}]
+    # Build messages: prior history (last N turns) + current question
+    messages: list[dict] = []
+    if history:
+        start_idx = max(0, len(history) - MAX_HISTORY_TURNS * 2)
+        for i in range(start_idx, len(history)):
+            msg = history[i]
+            if msg.get("role") in ("user", "assistant") and msg.get("content"):
+                messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": question})
 
-    for attempt in range(2):
+    intermediate_steps: list[dict] = []
+
+    for iteration in range(MAX_TOOL_ITERATIONS):
         try:
             response = client.messages.create(
                 model=MODEL,
-                max_tokens=2048,
+                max_tokens=4096,
                 system=system_prompt,
+                tools=[RUN_SQL_TOOL],
                 messages=messages,
             )
         except anthropic.APIError as e:
             return None, None, False, f"**Anthropic API Error:** {e.message}", "table", ""
 
-        raw = response.content[0].text
-        parsed = _parse_response(raw)
+        if response.stop_reason == "end_turn":
+            # LLM gave final text response — extract text block and parse XML
+            raw = next(
+                (block.text for block in response.content if isinstance(block, anthropic.types.TextBlock)),
+                "",
+            )
+            parsed = _parse_response(raw)
 
-        if not parsed:
-            # LLM didn't follow format — surface the raw response as reasoning, no chart
-            return None, None, False, raw, "table", raw
+            if not parsed:
+                error_msg = raw if raw else "The model returned an unexpected response format. Please try again."
+                return None, None, False, error_msg, "table", raw
 
-        reasoning, chart_type, sql = parsed
+            reasoning, chart_type, sql = parsed
 
-        try:
-            result = run_query(con, sql)
-            return sql, result.df, result.truncated, reasoning, chart_type, raw
-        except Exception as e:
-            if attempt == 0:
-                # First failure — give the LLM its own output + error, let it self-correct
-                messages.extend([
-                    {"role": "assistant", "content": raw},
-                    {
+            # Prepend intermediate step summary to reasoning if any steps were run
+            if intermediate_steps:
+                steps_text = "**Intermediate queries:**\n" + "\n".join(
+                    f"- {s['label']}: {s['row_count']:,} rows" for s in intermediate_steps
+                )
+                reasoning = steps_text + "\n\n" + reasoning
+
+            try:
+                result = run_query(con, sql)
+                return sql, result.df, result.truncated, reasoning, chart_type, raw
+            except Exception as e:
+                if iteration < MAX_TOOL_ITERATIONS - 1:
+                    # Self-correction: give LLM its error and ask it to fix
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({
                         "role": "user",
                         "content": (
                             f"That SQL produced an error:\n```\n{e}\n```\n"
                             "Please analyse the error, fix the SQL, and respond in the same XML format."
                         ),
-                    },
-                ])
-            else:
-                # Second failure — give up
+                    })
+                    continue
                 return sql, None, False, f"{reasoning}\n\n**Query error (after retry):** {e}", chart_type, raw
 
-    # Unreachable — every loop iteration returns explicitly
-    return None, None, False, "Unexpected error", "table", ""  # pragma: no cover
+        elif response.stop_reason == "tool_use":
+            # LLM called run_sql — execute each tool call and collect results
+            tool_results = []
+
+            for block in response.content:
+                if block.type == "tool_use" and block.name == "run_sql":
+                    sql_to_run = block.input.get("sql", "")
+                    label = block.input.get("label", f"query {len(intermediate_steps) + 1}")
+
+                    try:
+                        result = run_query(con, sql_to_run)
+                        # Cap rows sent back to LLM to keep context size manageable
+                        rows = result.df.head(100).values.tolist()
+                        content = json.dumps({
+                            "columns": list(result.df.columns),
+                            "rows": rows,
+                            "total_rows": len(result.df),
+                            "truncated": result.truncated,
+                        })
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": content,
+                        })
+                        intermediate_steps.append({"label": label, "row_count": len(result.df)})
+                    except Exception as e:
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "is_error": True,
+                            "content": str(e),
+                        })
+
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+
+        else:
+            # Unexpected stop reason (e.g. max_tokens exceeded)
+            break
+
+    return None, None, False, "Agent reached maximum iterations without a final answer.", "table", ""

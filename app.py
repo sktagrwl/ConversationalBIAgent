@@ -50,6 +50,11 @@ for msg in st.session_state.messages:
 
 # Input
 if prompt := st.chat_input("Ask a question about your data..."):
+    # Build history BEFORE appending the current question — prevents duplicate messages in LLM context
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.messages
+    ]
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -57,7 +62,7 @@ if prompt := st.chat_input("Ask a question about your data..."):
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             sql, df, truncated, reasoning, chart_type, _ = answer_question(
-                prompt, st.session_state.con
+                prompt, st.session_state.con, history=history
             )
 
         if sql:
@@ -78,6 +83,8 @@ if prompt := st.chat_input("Ask a question about your data..."):
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.dataframe(df, use_container_width=True)
+            else:
+                st.info("Query returned no results.")
 
         st.session_state.messages.append({
             "role": "assistant",
