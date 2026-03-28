@@ -18,10 +18,13 @@ if "con" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "schema" not in st.session_state:
+    st.session_state.schema = get_schema(st.session_state.con)
+
 # Sidebar: show loaded tables with row counts
 with st.sidebar:
     st.header("Loaded Tables")
-    schema = get_schema(st.session_state.con)
+    schema = st.session_state.schema
     if schema:
         for table, info in schema.items():
             label = f"{table} ({info['row_count']:,} rows)"
@@ -32,7 +35,7 @@ with st.sidebar:
         st.info("No CSV files found in data/.\nAdd your CSVs and restart.")
 
 # Chat history
-for msg in st.session_state.messages:
+for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         df = msg.get("df")
@@ -47,6 +50,15 @@ for msg in st.session_state.messages:
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.dataframe(df, use_container_width=True)
+            if msg.get("insight"):
+                st.markdown(f"*{msg['insight']}*")
+            st.download_button(
+                label="Download CSV",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name="query_results.csv",
+                mime="text/csv",
+                key=f"download_{i}",
+            )
 
 # Input
 if prompt := st.chat_input("Ask a question about your data..."):
@@ -61,7 +73,7 @@ if prompt := st.chat_input("Ask a question about your data..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            sql, df, truncated, reasoning, chart_type, _ = answer_question(
+            sql, df, truncated, reasoning, chart_type, insight, _ = answer_question(
                 prompt, st.session_state.con, history=history
             )
 
@@ -72,7 +84,7 @@ if prompt := st.chat_input("Ask a question about your data..."):
         st.markdown(reasoning)
 
         if df is not None:
-            if len(df) > 0:
+            if not df.empty:
                 if truncated:
                     st.warning(
                         f"Results truncated to {MAX_ROWS:,} rows. "
@@ -83,6 +95,14 @@ if prompt := st.chat_input("Ask a question about your data..."):
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.dataframe(df, use_container_width=True)
+                if insight:
+                    st.markdown(f"*{insight}*")
+                st.download_button(
+                    label="Download CSV",
+                    data=df.to_csv(index=False).encode("utf-8"),
+                    file_name="query_results.csv",
+                    mime="text/csv",
+                )
             else:
                 st.info("Query returned no results.")
 
@@ -92,4 +112,5 @@ if prompt := st.chat_input("Ask a question about your data..."):
             "df": df,
             "truncated": truncated,
             "chart_type": chart_type,
+            "insight": insight,
         })

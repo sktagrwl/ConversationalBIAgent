@@ -1,4 +1,3 @@
-import xml.etree.ElementTree as ET
 import re
 import json
 from typing import Any
@@ -57,46 +56,50 @@ def _schema_to_text(schema: dict) -> str:
     return "\n".join(lines)
 
 
-def _parse_response(text: str) -> tuple[str, str, str] | None:
+def _parse_response(text: str) -> tuple[str, str, str, str] | None:
     """
-    Parse the LLM's structured XML response.
-    Returns (reasoning, chart_type, sql) or None on parse failure.
+    Parse the LLM's structured XML response using regex.
+    Returns (reasoning, chart_type, sql, insight) or None on parse failure.
+
+    Uses regex instead of an XML parser so SQL containing `<` / `>` operators
+    (e.g. WHERE count < 10) does not cause a parse error.
 
     LLM role boundary — enforced by this parser:
       - LLM receives: schema metadata + question
-      - LLM outputs: reasoning, chart_type, SQL
+      - LLM outputs: reasoning, chart_type, SQL, insight
       - LLM NEVER sees data rows (only tool_result summaries for intermediate steps)
     """
-    try:
-        match = re.search(r"<response>.*?</response>", text, re.DOTALL | re.IGNORECASE)
-        if not match:
-            return None
-        valid_xml = match.group(0)
-        root = ET.fromstring(valid_xml)
-        reasoning = (root.findtext("reasoning") or "").strip()
-        chart_type = (root.findtext("chart_type") or "table").strip().lower()
-        sql = (root.findtext("sql") or "").strip()
-        if sql:
-            return reasoning, chart_type, sql
+    if not re.search(r"<response>", text, re.IGNORECASE):
         return None
-    except ET.ParseError:
+    reasoning_m  = re.search(r"<reasoning>(.*?)</reasoning>",   text, re.DOTALL | re.IGNORECASE)
+    chart_type_m = re.search(r"<chart_type>(.*?)</chart_type>", text, re.DOTALL | re.IGNORECASE)
+    sql_m        = re.search(r"<sql>(.*?)</sql>",               text, re.DOTALL | re.IGNORECASE)
+    insight_m    = re.search(r"<insight>(.*?)</insight>",       text, re.DOTALL | re.IGNORECASE)
+    sql = sql_m.group(1).strip() if sql_m else ""
+    if not sql:
         return None
+    return (
+        reasoning_m.group(1).strip()          if reasoning_m  else "",
+        chart_type_m.group(1).strip().lower() if chart_type_m else "table",
+        sql,
+        insight_m.group(1).strip()            if insight_m    else "",
+    )
 
 
 def answer_question(
     question: str, con, history: list[dict[str, Any]] | None = None
-) -> tuple[str | None, pd.DataFrame | None, bool, str, str, str]:
+) -> tuple[str | None, pd.DataFrame | None, bool, str, str, str, str]:
     """
     Tool-use agent: LLM can call run_sql for intermediate exploration,
     then gives a final XML response with reasoning, chart_type, and display SQL.
     Conversation history is included for multi-turn context.
 
-    Returns (sql, dataframe, truncated, reasoning, chart_type, raw_llm_response).
+    Returns (sql, dataframe, truncated, reasoning, chart_type, insight, raw_llm_response).
     """
     schema = get_schema(con)
 
     if not schema:
-        return None, None, False, "No CSV files found in data/. Add your CSVs and restart.", "table", ""
+        return None, None, False, "No CSV files found in data/. Add your CSVs and restart.", "table", "", ""
 
     schema_text = _schema_to_text(schema)
 
@@ -124,6 +127,9 @@ When you are ready to give the final answer, respond with this EXACT XML format 
   <sql>
     SELECT ...
   </sql>
+  <insight>
+    2-3 sentences interpreting the key pattern or finding in the data. Reference specific values or ranks where possible.
+  </insight>
 </response>
 
 Query planning — run these 3 steps before writing SQL for any hierarchy or metric question:
@@ -203,21 +209,24 @@ Use DuckDB SQL syntax. All table names are exactly as listed above."""
                 messages=messages,
             )
         except anthropic.APIError as e:
-            return None, None, False, f"**Anthropic API Error:** {e.message}", "table", ""
+            return None, None, False, f"**Anthropic API Error:** {e.message}", "table", "", ""
 
         if response.stop_reason == "end_turn":
             # LLM gave final text response — extract text block and parse XML
-            raw = next(
-                (block.text for block in response.content if isinstance(block, anthropic.types.TextBlock)),
-                "",
-            )
+            raw = ""
+            if hasattr(response, "content") and isinstance(response.content, list):
+                for block in response.content:
+                    if getattr(block, "type", None) == "text" and hasattr(block, "text"):
+                        raw = block.text
+                        break
+            
             parsed = _parse_response(raw)
 
             if not parsed:
                 error_msg = raw if raw else "The model returned an unexpected response format. Please try again."
-                return None, None, False, error_msg, "table", raw
+                return None, None, False, error_msg, "table", "", raw
 
-            reasoning, chart_type, sql = parsed
+            reasoning, chart_type, sql, insight = parsed
 
             # Prepend intermediate step summary to reasoning if any steps were run
             if intermediate_steps:
@@ -228,7 +237,7 @@ Use DuckDB SQL syntax. All table names are exactly as listed above."""
 
             try:
                 result = run_query(con, sql)
-                return sql, result.df, result.truncated, reasoning, chart_type, raw
+                return sql, result.df, result.truncated, reasoning, chart_type, insight, raw
             except Exception as e:
                 if iteration < MAX_TOOL_ITERATIONS - 1:
                     # Self-correction: give LLM its error and ask it to fix
@@ -241,7 +250,7 @@ Use DuckDB SQL syntax. All table names are exactly as listed above."""
                         ),
                     })
                     continue
-                return sql, None, False, f"{reasoning}\n\n**Query error (after retry):** {e}", chart_type, raw
+                return sql, None, False, f"{reasoning}\n\n**Query error (after retry):** {e}", chart_type, "", raw
 
         elif response.stop_reason == "tool_use":
             # LLM called run_sql — execute each tool call and collect results
@@ -283,4 +292,4 @@ Use DuckDB SQL syntax. All table names are exactly as listed above."""
             # Unexpected stop reason (e.g. max_tokens exceeded)
             break
 
-    return None, None, False, "Agent reached maximum iterations without a final answer.", "table", ""
+    return None, None, False, "Agent reached maximum iterations without a final answer.", "table", "", ""

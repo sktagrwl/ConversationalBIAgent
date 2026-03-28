@@ -241,7 +241,7 @@ def get_connection() -> duckdb.DuckDBPyConnection:
         ext = os.path.splitext(path)[1].lower()
         read_fn = f"read_parquet('{path}')" if ext == ".parquet" else f"read_csv_auto('{path}')"
         print(f"[database] Materializing '{table_name}' from {os.path.basename(path)} ...")
-        con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {read_fn}")
+        con.execute(f'CREATE TABLE "{table_name}" AS SELECT * FROM {read_fn}')
         print(f"[database] Done: '{table_name}'")
 
     # Phase 2: Migrate schema (no-op if already up to date), then build derived tables
