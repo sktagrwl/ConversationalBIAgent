@@ -196,18 +196,20 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     """
     con = duckdb.connect(database=DB_PATH)
 
-    # Phase 1: Materialize raw CSVs
+    # Phase 1: Materialize raw source files (Parquet preferred, CSV fallback)
     existing_tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
-    csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+    source_files = glob.glob(os.path.join(DATA_DIR, "*.parquet"))
+    if not source_files:
+        source_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
 
-    for path in csv_files:
+    for path in source_files:
         table_name = os.path.splitext(os.path.basename(path))[0]
         if table_name in existing_tables:
             continue
+        ext = os.path.splitext(path)[1].lower()
+        read_fn = f"read_parquet('{path}')" if ext == ".parquet" else f"read_csv_auto('{path}')"
         print(f"[database] Materializing '{table_name}' from {os.path.basename(path)} ...")
-        con.execute(
-            f"CREATE TABLE {table_name} AS SELECT * FROM read_csv_auto('{path}')"
-        )
+        con.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {read_fn}")
         print(f"[database] Done: '{table_name}'")
 
     # Phase 2: Migrate schema (no-op if already up to date), then build derived tables
