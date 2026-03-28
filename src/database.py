@@ -13,6 +13,7 @@ QueryResult = collections.namedtuple("QueryResult", ["df", "truncated"])
 # Exported so agent._schema_to_text() can classify tables without extra DB queries.
 DERIVED_TABLES: frozenset[str] = frozenset({
     "order_products",
+    "user_order_timeline",
     "fact_orders",
     "product_metrics",
     "aisle_metrics",
@@ -22,13 +23,14 @@ DERIVED_TABLES: frozenset[str] = frozenset({
 })
 
 # Build order:
-#   1. order_products     — unified prior+train product rows (test excluded: no basket data)
-#   2. fact_orders        — full hierarchy denormalized (depends on order_products + lookups)
-#   3. aisle_metrics      — depends on fact_orders
-#   4. product_metrics    — depends on order_products
-#   5. order_metrics      — depends on order_products
-#   6. user_metrics       — depends on order_metrics
-#   7. department_metrics — depends on fact_orders (fixed: correct reorder_rate formula)
+#   1. order_products        — unified prior+train product rows (test excluded: no basket data)
+#   2. user_order_timeline   — cumulative days_since_first_order per user (depends on orders)
+#   3. fact_orders           — full hierarchy + temporal columns (depends on order_products + user_order_timeline)
+#   4. aisle_metrics         — depends on fact_orders
+#   5. product_metrics       — depends on order_products
+#   6. order_metrics         — depends on order_products
+#   7. user_metrics          — depends on order_metrics
+#   8. department_metrics    — depends on fact_orders (fixed: correct reorder_rate formula)
 _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
     (
         "order_products",
@@ -37,6 +39,25 @@ _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
         SELECT order_id, product_id, add_to_cart_order, reordered FROM order_products__prior
         UNION ALL
         SELECT order_id, product_id, add_to_cart_order, reordered FROM order_products__train
+        """,
+    ),
+    (
+        "user_order_timeline",
+        """
+        CREATE TABLE IF NOT EXISTS user_order_timeline AS
+        SELECT
+            order_id,
+            user_id,
+            order_number,
+            order_dow,
+            order_hour_of_day,
+            SUM(COALESCE(days_since_prior_order, 0)) OVER (
+                PARTITION BY user_id
+                ORDER BY order_number
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS days_since_first_order
+        FROM orders
+        WHERE eval_set IN ('prior', 'train')
         """,
     ),
     (
@@ -52,11 +73,17 @@ _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
             d.department_id,
             d.department,
             op.reordered,
-            op.add_to_cart_order
+            op.add_to_cart_order,
+            t.user_id,
+            t.order_number,
+            t.order_dow,
+            t.order_hour_of_day,
+            t.days_since_first_order
         FROM order_products op
-        JOIN products p    ON op.product_id   = p.product_id
-        JOIN aisles a      ON p.aisle_id      = a.aisle_id
-        JOIN departments d ON p.department_id = d.department_id
+        JOIN products p             ON op.product_id  = p.product_id
+        JOIN aisles a               ON p.aisle_id     = a.aisle_id
+        JOIN departments d          ON p.department_id = d.department_id
+        JOIN user_order_timeline t  ON op.order_id    = t.order_id
         """,
     ),
     (
@@ -160,14 +187,19 @@ _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
 
 def _migrate_schema(con: duckdb.DuckDBPyConnection) -> None:
     """
-    One-time migration: if fact_orders is missing, drop stale derived tables
-    so _build_derived_tables() rebuilds them with updated SQL.
-    Safe to call on every startup — no-op once fact_orders exists.
+    One-time migrations: drop stale derived tables so _build_derived_tables() rebuilds them.
+    Safe to call on every startup — each check is a no-op once the target table exists.
     """
     existing = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
+    # Migration 1: first-time fact_orders (pre-existing stale aisle/department tables)
     if "fact_orders" not in existing:
         print("[database] Migrating schema: dropping stale derived tables to rebuild ...")
         for tbl in ("department_metrics", "aisle_metrics"):
+            con.execute(f"DROP TABLE IF EXISTS {tbl}")
+    # Migration 2: user_order_timeline missing → fact_orders lacks temporal columns → rebuild
+    if "user_order_timeline" not in existing:
+        print("[database] Migrating schema: adding user_order_timeline, rebuilding fact_orders ...")
+        for tbl in ("department_metrics", "aisle_metrics", "fact_orders"):
             con.execute(f"DROP TABLE IF EXISTS {tbl}")
 
 

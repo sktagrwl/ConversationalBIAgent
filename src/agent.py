@@ -169,6 +169,16 @@ Data partitioning context (Instacart dataset):
 - 'test' orders are excluded from order_products — their basket data does not exist.
 - Never filter by eval_set unless the user explicitly asks about it. Do not write WHERE eval_set = 'prior'.
 
+Temporal context (no calendar dates exist):
+- There are NO date/timestamp columns. Do not reference order_date, created_at, month, year, or any date column.
+- Time is represented as: order_number (per-user sequence 1,2,3...) and days_since_prior_order (gap in days, NULL for first order).
+- fact_orders.days_since_first_order — pre-computed cumulative days from each user's first order. Use this for timeline/trend queries — no window function needed.
+- fact_orders also has order_number, order_dow, order_hour_of_day directly — no join to order_metrics needed for sequence/day/hour analysis.
+- Purchase frequency → use user_metrics.avg_days_between_orders (pre-computed) or AVG(days_since_prior_order) from order_metrics.
+- Trends over order sequence → GROUP BY order_number from fact_orders or order_metrics (chart_type: line).
+- Day-of-week / hour patterns → use order_dow (0=Sunday) and order_hour_of_day from fact_orders or order_metrics.
+- days_since_prior_order is NULL for each user's first order. Use AVG (ignores NULLs) or COALESCE(days_since_prior_order, 0).
+
 Use DuckDB SQL syntax. All table names are exactly as listed above."""
 
     # Build messages: prior history (last N turns) + current question

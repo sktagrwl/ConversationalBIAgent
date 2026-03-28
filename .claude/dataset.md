@@ -35,6 +35,26 @@ The raw data splits rows across three ML evaluation partitions via an `eval_set`
 - Any filter on `eval_set` in a query is almost certainly a bug.
 - There is no need to think about `eval_set` when querying derived tables — the partition is already resolved.
 
+## Rule 4: No Absolute Timestamps — Temporal Reasoning Is Relative
+
+There are **no calendar dates** in this dataset. Do not generate date/month/year filters.
+
+| What exists | What it means |
+|---|---|
+| `order_number` | Sequential per-user order index (1, 2, 3…) |
+| `days_since_prior_order` | Days elapsed since previous order (NULL for first order) |
+
+**Correct patterns:**
+- Purchase frequency → `AVG(days_since_prior_order)` (already in `user_metrics.avg_days_between_orders`)
+- User timeline → `SUM(days_since_prior_order) OVER (PARTITION BY user_id ORDER BY order_number)`
+- Recency → `MAX(order_number)` per user, not a date comparison
+- Sequence analysis → use `order_number` as the time axis
+
+**Forbidden patterns:**
+- `WHERE order_date > ...` — column does not exist
+- `GROUP BY month/year` — no calendar fields
+- Any assumption that `days_since_prior_order` maps to a real date
+
 ## Rule 3: CSV → Table Name Mapping
 
 `data/<name>.csv` → `<name>` table in DuckDB. This is automatic on startup.
