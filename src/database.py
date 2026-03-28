@@ -20,6 +20,7 @@ DERIVED_TABLES: frozenset[str] = frozenset({
     "order_metrics",
     "user_metrics",
     "department_metrics",
+    "product_pairs",
 })
 
 # Build order:
@@ -31,6 +32,7 @@ DERIVED_TABLES: frozenset[str] = frozenset({
 #   6. order_metrics         — depends on order_products
 #   7. user_metrics          — depends on order_metrics
 #   8. department_metrics    — depends on fact_orders (fixed: correct reorder_rate formula)
+#   9. product_pairs         — reordered product co-occurrence for top 200 products (depends on fact_orders + product_metrics)
 _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
     (
         "order_products",
@@ -180,6 +182,41 @@ _DERIVED_TABLE_SQL: list[tuple[str, str]] = [
             ROUND(AVG(add_to_cart_order), 2)            AS avg_cart_position
         FROM fact_orders
         GROUP BY department_id, department
+        """,
+    ),
+    (
+        "product_pairs",
+        # Basket affinity: which reordered products are bought together most often.
+        # Scoped to top 200 products by order volume to keep the self-join tractable.
+        # a.product_id < b.product_id deduplicates pairs and removes self-pairs.
+        """
+        CREATE TABLE IF NOT EXISTS product_pairs AS
+        WITH top_products AS (
+            SELECT product_id
+            FROM product_metrics
+            ORDER BY total_orders DESC
+            LIMIT 200
+        ),
+        reordered AS (
+            SELECT order_id, product_id
+            FROM fact_orders
+            WHERE reordered = 1
+              AND product_id IN (SELECT product_id FROM top_products)
+        )
+        SELECT
+            a.product_id        AS product_1_id,
+            b.product_id        AS product_2_id,
+            pm1.product_name    AS product_1,
+            pm2.product_name    AS product_2,
+            COUNT(*)            AS co_occurrence_count
+        FROM reordered a
+        JOIN reordered b
+            ON a.order_id = b.order_id
+           AND a.product_id < b.product_id
+        JOIN product_metrics pm1 ON a.product_id = pm1.product_id
+        JOIN product_metrics pm2 ON b.product_id = pm2.product_id
+        GROUP BY a.product_id, b.product_id, pm1.product_name, pm2.product_name
+        ORDER BY co_occurrence_count DESC
         """,
     ),
 ]

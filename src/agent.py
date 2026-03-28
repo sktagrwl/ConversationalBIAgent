@@ -183,7 +183,11 @@ Temporal context (no calendar dates exist):
 - Purchase frequency → use user_metrics.avg_days_between_orders (pre-computed) or AVG(days_since_prior_order) from order_metrics.
 - Trends over order sequence → GROUP BY order_number from fact_orders or order_metrics (chart_type: line).
 - Day-of-week / hour patterns → use order_dow (0=Sunday) and order_hour_of_day from fact_orders or order_metrics.
-- days_since_prior_order is NULL for each user's first order. Use AVG (ignores NULLs) or COALESCE(days_since_prior_order, 0).
+- days_since_prior_order is NULL for the first order of every user. NULL means "no prior order exists" — NOT 0 days.
+- Case 1 — Average reorder interval: use AVG(days_since_prior_order) or WHERE days_since_prior_order IS NOT NULL. Prefer user_metrics.avg_days_between_orders (pre-computed). NEVER use COALESCE(days_since_prior_order, 0) inside AVG — it replaces NULLs with 0 and corrupts the mean.
+- Case 2 — Interval distribution: always filter WHERE days_since_prior_order IS NOT NULL before GROUP BY to exclude first orders.
+- Case 3 — Timeline reconstruction: COALESCE(days_since_prior_order, 0) inside SUM OVER (...) is correct (first order = day 0 baseline). Already pre-computed as fact_orders.days_since_first_order — use that column, do not recompute.
+- Case 4 — Reorder-only analysis: filter WHERE order_number > 1 to exclude first orders entirely.
 
 Use DuckDB SQL syntax. All table names are exactly as listed above."""
 
@@ -203,7 +207,7 @@ Use DuckDB SQL syntax. All table names are exactly as listed above."""
         try:
             response = client.messages.create(
                 model=MODEL,
-                max_tokens=4096,
+                max_tokens=3072,
                 system=system_prompt,
                 tools=[RUN_SQL_TOOL],
                 messages=messages,
@@ -219,7 +223,7 @@ Use DuckDB SQL syntax. All table names are exactly as listed above."""
                     if getattr(block, "type", None) == "text" and hasattr(block, "text"):
                         raw = block.text
                         break
-            
+         
             parsed = _parse_response(raw)
 
             if not parsed:

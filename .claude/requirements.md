@@ -21,4 +21,3 @@
 ## Phase 4 — Production Hardening
 - [ ] SQL safety: block DDL/DML statements
 - [ ] Caching: cache query results for identical questions within a session
-- [ ] Unit tests for database.py, agent.py, visualization.py

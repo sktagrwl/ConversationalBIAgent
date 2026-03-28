@@ -55,6 +55,19 @@ There are **no calendar dates** in this dataset. Do not generate date/month/year
 - `GROUP BY month/year` — no calendar fields
 - Any assumption that `days_since_prior_order` maps to a real date
 
+### NULL semantics for days_since_prior_order
+
+NULL occurs once per user: on `order_number = 1`. It means "no prior order" — not 0 days.
+
+| Case | Pattern | Note |
+|---|---|---|
+| Average interval | `AVG(days_since_prior_order)` or `WHERE days_since_prior_order IS NOT NULL` | AVG auto-excludes NULLs; explicit filter also fine |
+| Distribution | `WHERE days_since_prior_order IS NOT NULL` before `GROUP BY` | Always exclude first orders |
+| Timeline SUM | `COALESCE(days_since_prior_order, 0)` inside `SUM OVER (...)` | First order = day 0 baseline; already in `fact_orders.days_since_first_order` |
+| Reorder-only | `WHERE order_number > 1` | Removes first orders entirely |
+
+`COALESCE(days_since_prior_order, 0)` inside `AVG()` or any aggregate is always a bug — it biases interval metrics toward 0.
+
 ## Rule 3: CSV → Table Name Mapping
 
 `data/<name>.csv` → `<name>` table in DuckDB. This is automatic on startup.

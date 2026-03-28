@@ -27,6 +27,7 @@ python -m pytest tests/ -v
 - **Derived tables first**: Never query raw CSV tables directly — they have 32M+ rows
 - **eval_set**: Never filter `WHERE eval_set = 'prior'` — this silently discards valid `train` rows. Any filter on `eval_set` in a generated query is almost certainly a bug.
 - **Persistent DB**: Delete `data/warehouse.duckdb` to force full re-materialization from CSVs
+- **days_since_prior_order NULLs**: NULL = first order ("no prior order"), not 0 days. NEVER use `COALESCE(days_since_prior_order, 0)` in AVG or distribution queries — corrupts interval metrics. Only valid inside cumulative `SUM OVER (...)` windows (already materialized as `fact_orders.days_since_first_order`).
 
 ## Architecture
 
