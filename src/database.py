@@ -242,14 +242,18 @@ def _migrate_schema(con: duckdb.DuckDBPyConnection) -> None:
 
 def _build_derived_tables(con: duckdb.DuckDBPyConnection) -> None:
     """
-    Build derived tables from raw CSV tables.
+    Build derived tables from raw tables.
     Uses CREATE TABLE IF NOT EXISTS — safe to call on every startup; no-op when tables exist.
-    Order is significant: order_products first, then product_metrics/order_metrics, then user_metrics/department_metrics.
+    Order is significant. Caught exceptions gracefully skip building if required base tables (like Instacart specific rows) are totally missing.
     """
     for table_name, sql in _DERIVED_TABLE_SQL:
-        print(f"[database] Ensuring derived table '{table_name}' exists ...")
-        con.execute(sql)
-    print("[database] All derived tables ready.")
+        try:
+            print(f"[database] Ensuring derived table '{table_name}' exists ...")
+            con.execute(sql)
+        except duckdb.Error as e:
+            print(f"[database] Skipping derived table '{table_name}' (missing base tables or columns?): {e}")
+            break
+    print("[database] Derived tables materialization finished.")
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
@@ -257,7 +261,7 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     Connect to (or create) a persistent DuckDB file at DB_PATH.
 
     Phase 1 — CSV materialization (first run only, skipped thereafter):
-      Reads CSVs from DATA_DIR, creates native DuckDB tables.
+      Reads CSVs from DATA_DIR, creates native DuckDB tables. Auto-converts to Parquet if needed.
 
     Phase 2 — Derived table build (first run only, no-op thereafter):
       Builds product_metrics, order_metrics, user_metrics, department_metrics
@@ -265,20 +269,36 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     """
     con = duckdb.connect(database=DB_PATH)
 
-    # Phase 1: Materialize raw source files (Parquet preferred, CSV fallback)
+    # Phase 1: Materialize raw source files. Auto-convert loose CSVs to Parquet.
     existing_tables = {row[0] for row in con.execute("SHOW TABLES").fetchall()}
-    source_files = glob.glob(os.path.join(DATA_DIR, "*.parquet"))
-    if not source_files:
-        source_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+    
+    parquet_files = glob.glob(os.path.join(DATA_DIR, "*.parquet"))
+    parquet_basenames = {os.path.basename(p) for p in parquet_files}
+    
+    for csv_file in glob.glob(os.path.join(DATA_DIR, "*.csv")):
+        name = os.path.splitext(os.path.basename(csv_file))[0]
+        expected_parquet = f"{name}.parquet"
+        
+        if expected_parquet not in parquet_basenames:
+            parquet_path = os.path.join(DATA_DIR, expected_parquet)
+            print(f"[database] Auto-converting {os.path.basename(csv_file)} to Parquet ...")
+            try:
+                con.execute(
+                    f"COPY (SELECT * FROM read_csv_auto('{csv_file.replace(chr(39), chr(39)+chr(39))}')) TO '{parquet_path.replace(chr(39), chr(39)+chr(39))}' "
+                    f"(FORMAT PARQUET, COMPRESSION ZSTD)"
+                )
+                parquet_files.append(parquet_path)
+                parquet_basenames.add(expected_parquet)
+            except duckdb.Error as e:
+                print(f"[database] Warning: Failed to convert {os.path.basename(csv_file)} to Parquet: {e}")
 
-    for path in source_files:
+    # Materialize from Parquet files
+    for path in parquet_files:
         table_name = os.path.splitext(os.path.basename(path))[0]
         if table_name in existing_tables:
             continue
-        ext = os.path.splitext(path)[1].lower()
-        read_fn = f"read_parquet('{path}')" if ext == ".parquet" else f"read_csv_auto('{path}')"
         print(f"[database] Materializing '{table_name}' from {os.path.basename(path)} ...")
-        con.execute(f'CREATE TABLE "{table_name}" AS SELECT * FROM {read_fn}')
+        con.execute(f"CREATE TABLE \"{table_name}\" AS SELECT * FROM read_parquet('{path}')")
         print(f"[database] Done: '{table_name}'")
 
     # Phase 2: Migrate schema (no-op if already up to date), then build derived tables

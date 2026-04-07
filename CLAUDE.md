@@ -26,7 +26,7 @@ python -m pytest tests/ -v
 - **Environment**: Copy `.env.example` to `.env` and set `ANTHROPIC_API_KEY`
 - **Derived tables first**: Never query raw CSV tables directly — they have 32M+ rows
 - **eval_set**: Never filter `WHERE eval_set = 'prior'` — this silently discards valid `train` rows. Any filter on `eval_set` in a generated query is almost certainly a bug.
-- **Persistent DB**: Delete `data/warehouse.duckdb` to force full re-materialization from CSVs
+- **Persistent DB**: Delete `data/warehouse.duckdb` and cached `.parquet` files to force full re-materialization from CSVs
 - **days_since_prior_order NULLs**: NULL = first order ("no prior order"), not 0 days. NEVER use `COALESCE(days_since_prior_order, 0)` in AVG or distribution queries — corrupts interval metrics. Only valid inside cumulative `SUM OVER (...)` windows (already materialized as `fact_orders.days_since_first_order`).
 
 ## Architecture
@@ -52,7 +52,7 @@ On SQL execution failure, `answer_question()` makes one retry: it appends the er
 
 ### Database (`src/database.py`)
 `get_connection()` runs two phases on startup (both are no-ops once tables exist):
-1. **CSV materialization** — `data/<name>.csv` → `<name>` table. Automatic, filename-based.
+1. **Parquet/CSV materialization** — Parquet are preferred. `data/<name>.csv` are auto-converted to `<name>.parquet` and then ingested as DuckDB tables.
 2. **Derived table build** — fixed build order (each depends on the previous):
 
 | Table | Built from | Purpose |

@@ -68,8 +68,8 @@ NULL occurs once per user: on `order_number = 1`. It means "no prior order" — 
 
 `COALESCE(days_since_prior_order, 0)` inside `AVG()` or any aggregate is always a bug — it biases interval metrics toward 0.
 
-## Rule 3: CSV → Table Name Mapping
+## Rule 3: CSV/Parquet → Table Name Mapping
 
-`data/<name>.csv` → `<name>` table in DuckDB. This is automatic on startup.
+`data/<name>.csv` automatically gets converted to a `<name>.parquet` file, which becomes the `<name>` table in DuckDB on startup.
 
-Deleting `data/warehouse.duckdb` forces full re-materialization from CSVs on next app start. Do this when CSVs change.
+Deleting `data/warehouse.duckdb` and the generated `.parquet` files forces full re-materialization from CSVs on next app start. Do this when your underlying CSVs change.
