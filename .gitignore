@@ -8,3 +8,4 @@ __pycache__/
 *.duckdb
 data/*.csv
 data/*.parquet
+data/derived_tables.sql

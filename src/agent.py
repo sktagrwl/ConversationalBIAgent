@@ -86,6 +86,99 @@ def _parse_response(text: str) -> tuple[str, str, str, str] | None:
     )
 
 
+def _build_dynamic_guidance(schema: dict) -> str:
+    """
+    Inspect the live schema to generate dataset-specific hints for the system prompt.
+    Replaces the hardcoded Instacart-specific sections.
+    """
+    all_columns = {col["column"] for info in schema.values() for col in info["columns"]}
+    lines = []
+
+    has_dates = any(
+        any(kw in col.lower() for kw in ("date", "timestamp", "time", "created", "updated"))
+        for col in all_columns
+    )
+    if not has_dates:
+        lines.append(
+            "Note: This dataset has no date/timestamp columns. "
+            "Do not reference date, month, year, or any calendar column that is not in the schema above."
+        )
+
+    large_tables = [t for t, info in schema.items() if info["row_count"] >= 1_000_000]
+    if large_tables:
+        lines.append(
+            f"Performance: {', '.join(large_tables)} are large (1M+ rows). "
+            "Prefer derived tables where available. Filter aggressively on large tables."
+        )
+
+    return "\n".join(lines)
+
+
+def _build_system_prompt(schema: dict) -> str:
+    """Build a fully dynamic, dataset-agnostic system prompt from the live schema."""
+    schema_text = _schema_to_text(schema)
+    dynamic_guidance = _build_dynamic_guidance(schema)
+
+    prompt = f"""You are a SQL expert and data analyst with access to the following DuckDB tables:
+
+{schema_text}
+
+You have a run_sql tool. Use it to:
+- Explore the data before committing to a final query: run DESCRIBE <table>, SELECT ... LIMIT 5, or COUNT queries
+- Validate assumptions about column values, NULLs, and relationships between tables
+- Run intermediate analytical steps when the question requires multi-step reasoning
+
+When you are ready to give the final answer, respond with this EXACT XML format — no text outside the tags:
+<response>
+  <reasoning>
+    Step 1: Aggregation level = [what the user wants to group by]
+    Step 2: Metric = [metric name and how it is computed]
+    Step 3: Table = [which table and why]
+  </reasoning>
+  <chart_type>bar</chart_type>
+  <sql>
+    SELECT ...
+  </sql>
+  <insight>
+    2-3 sentences interpreting the key pattern or finding in the data. Reference specific values or ranks where possible.
+  </insight>
+</response>
+
+Query planning — before writing final SQL:
+  Step 1 — Identify the aggregation level (what the user wants to group by).
+  Step 2 — Identify the metric (count, sum, average, rate — and the correct formula).
+  Step 3 — Choose the right table: prefer pre-aggregated derived tables for simple lookups;
+            recompute metrics from raw/fact tables when the aggregation level differs from
+            what a pre-built table provides.
+  NEVER roll up a pre-aggregated metric (e.g. AVG of a rate column at a coarser level is wrong —
+  recompute from the underlying fact table instead).
+
+Table selection rules:
+- Tables marked DERIVED are pre-aggregated. Use them as your first choice for simple lookups.
+- Tables marked RAW have millions of rows. Avoid full scans; filter before joining.
+- Use run_sql to explore unfamiliar tables before writing the final query.
+
+SQL performance rules:
+- Filter before joining: apply WHERE on the larger table before the JOIN, or use a CTE.
+- Top-N: always include ORDER BY <metric_column> DESC LIMIT 10 (adjust if the user specifies N).
+- Never write bare SELECT * — select specific columns or use aggregation. SELECT COUNT(*) is allowed.
+- When result size is uncertain, add LIMIT 100.
+
+Chart type guide (for final <chart_type>):
+- bar: comparisons, rankings, top-N (most common choice)
+- line: time-series or trends over an ordered sequence
+- scatter: correlation between two numeric dimensions
+- pie: part-of-whole proportions with ≤8 categories
+- table: exact values matter or no meaningful visual pattern
+"""
+
+    if dynamic_guidance:
+        prompt += f"\nDataset notes:\n{dynamic_guidance}\n"
+
+    prompt += "\nUse DuckDB SQL syntax. All table names are exactly as listed above."
+    return prompt
+
+
 def answer_question(
     question: str, con, history: list[dict[str, Any]] | None = None
 ) -> tuple[str | None, pd.DataFrame | None, bool, str, str, str, str]:
@@ -101,95 +194,7 @@ def answer_question(
     if not schema:
         return None, None, False, "No CSV files found in data/. Add your CSVs and restart.", "table", "", ""
 
-    schema_text = _schema_to_text(schema)
-
-    system_prompt = f"""You are a SQL expert and data analyst with access to the following DuckDB tables:
-
-{schema_text}
-
-Product hierarchy (3 levels):
-  product → aisle → department
-  Every fact_orders row contains all three levels pre-joined. Use it as the base for any hierarchy question.
-
-You have a run_sql tool. Use it to:
-- Explore the data before committing to a final query
-- Validate assumptions (e.g. check column values, NULL rates, row counts)
-- Run intermediate analytical steps when the question requires multi-step reasoning
-
-When you are ready to give the final answer, respond with this EXACT XML format — no text outside the tags:
-<response>
-  <reasoning>
-    Step 1: Aggregation level = [product|aisle|department|other]
-    Step 2: Metric = [metric name and formula]
-    Step 3: Table = [which table and why]
-  </reasoning>
-  <chart_type>bar</chart_type>
-  <sql>
-    SELECT ...
-  </sql>
-  <insight>
-    2-3 sentences interpreting the key pattern or finding in the data. Reference specific values or ranks where possible.
-  </insight>
-</response>
-
-Query planning — run these 3 steps before writing SQL for any hierarchy or metric question:
-
-  Step 1 — Detect aggregation level (what the user wants to group by):
-    - "products" / "items" / "what product"  → GROUP BY product_id, product_name
-    - "aisles" / "categories"                → GROUP BY aisle_id, aisle
-    - "departments" / "sections"             → GROUP BY department_id, department
-
-  Step 2 — Detect metric (how it must be computed):
-    - "reorder rate"         → SUM(reordered) * 1.0 / COUNT(*)   ← always recompute at target level
-    - "most popular" / "top" → COUNT(*) DESC
-    - "basket size"          → use order_metrics.basket_size
-
-  Step 3 — Choose table:
-    - Level needs fresh metric computation → fact_orders + GROUP BY <level>
-    - Level matches a pre-aggregated table AND no further computation needed
-        → use product_metrics / aisle_metrics / department_metrics directly
-    - NEVER roll up a pre-aggregated metric (e.g. AVG(product_metrics.reorder_rate) for
-      department-level reorder rate is WRONG — recompute from fact_orders instead)
-
-Table selection rules:
-- Tables marked DERIVED are pre-aggregated. Use them as your first choice for simple lookups.
-- Tables marked RAW have tens of millions of rows. Never query them directly.
-- Lookup tables (aisles, departments, products) may be joined freely.
-
-SQL performance rules:
-- Filter before joining: WHERE on the larger table before the JOIN, or use a CTE.
-- Top-N: always include ORDER BY <metric_column> DESC LIMIT 10 (adjust if user specifies N).
-- Never write bare SELECT * — select specific columns or aggregate. SELECT COUNT(*) is allowed.
-- When result size is uncertain, add LIMIT 100.
-
-Chart type guide (for final <chart_type>):
-- bar: comparisons, rankings, top-N (most common choice)
-- line: time-series or trends over an ordered sequence
-- scatter: correlation between two numeric dimensions
-- pie: part-of-whole proportions with ≤8 categories
-- table: exact values matter or no meaningful visual pattern
-
-Data partitioning context (Instacart dataset):
-- 'order_products' is the canonical product table — it combines prior + train orders (complete purchase history).
-- 'prior' orders = all orders except each user's last order. 'train' = last order for ~75% of users.
-- 'test' orders are excluded from order_products — their basket data does not exist.
-- Never filter by eval_set unless the user explicitly asks about it. Do not write WHERE eval_set = 'prior'.
-
-Temporal context (no calendar dates exist):
-- There are NO date/timestamp columns. Do not reference order_date, created_at, month, year, or any date column.
-- Time is represented as: order_number (per-user sequence 1,2,3...) and days_since_prior_order (gap in days, NULL for first order).
-- fact_orders.days_since_first_order — pre-computed cumulative days from each user's first order. Use this for timeline/trend queries — no window function needed.
-- fact_orders also has order_number, order_dow, order_hour_of_day directly — no join to order_metrics needed for sequence/day/hour analysis.
-- Purchase frequency → use user_metrics.avg_days_between_orders (pre-computed) or AVG(days_since_prior_order) from order_metrics.
-- Trends over order sequence → GROUP BY order_number from fact_orders or order_metrics (chart_type: line).
-- Day-of-week / hour patterns → use order_dow (0=Sunday) and order_hour_of_day from fact_orders or order_metrics.
-- days_since_prior_order is NULL for the first order of every user. NULL means "no prior order exists" — NOT 0 days.
-- Case 1 — Average reorder interval: use AVG(days_since_prior_order) or WHERE days_since_prior_order IS NOT NULL. Prefer user_metrics.avg_days_between_orders (pre-computed). NEVER use COALESCE(days_since_prior_order, 0) inside AVG — it replaces NULLs with 0 and corrupts the mean.
-- Case 2 — Interval distribution: always filter WHERE days_since_prior_order IS NOT NULL before GROUP BY to exclude first orders.
-- Case 3 — Timeline reconstruction: COALESCE(days_since_prior_order, 0) inside SUM OVER (...) is correct (first order = day 0 baseline). Already pre-computed as fact_orders.days_since_first_order — use that column, do not recompute.
-- Case 4 — Reorder-only analysis: filter WHERE order_number > 1 to exclude first orders entirely.
-
-Use DuckDB SQL syntax. All table names are exactly as listed above."""
+    system_prompt = _build_system_prompt(schema)
 
     # Build messages: prior history (last N turns) + current question
     messages: list[dict] = []
